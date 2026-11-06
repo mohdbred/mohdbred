@@ -71,11 +71,12 @@ def run(args, timeout=900):
 
 
 def run_json(args, timeout=900):
-    code, out = run(args + ["--json"], timeout)
+    p = subprocess.run([sys.executable] + args + ["--json"], capture_output=True, text=True, timeout=timeout)
     try:
-        return json.loads(out)
+        return json.loads(p.stdout)
     except ValueError:
-        return {"_error": "no JSON (exit %d): %s" % (code, out.strip()[:300])}
+        msg = (p.stdout.strip() or p.stderr.strip() or "no output").splitlines()[-1]
+        return {"_error": "no JSON (exit %d): %s" % (p.returncode, msg[:300])}
 
 
 def get_json(url, tries=3):
@@ -248,9 +249,36 @@ def news_flags(symbols, hours=168):
             continue
         ok.update(chunk)
         for it in d.get("items", []):
-            if EVENT_WORDS.search(it.get("title", "")):
-                flags.setdefault(it.get("ticker"), it["title"][:100])
+            title, tk = it.get("title", ""), it.get("ticker")
+            # Count it only if the headline is about THIS company (feeds tag
+            # related stories too, e.g. an ALB earnings preview under CF).
+            if EVENT_WORDS.search(title) and names_company(tk, title):
+                flags.setdefault(tk, title[:100])
     return flags, ok
+
+
+_NAMES = None
+
+
+def names_company(ticker, title):
+    """True if the headline mentions the ticker or the first word of the company name."""
+    global _NAMES
+    if _NAMES is None:
+        _NAMES = {}
+        try:
+            for line in open("trader/universe.txt"):
+                if "|" in line:
+                    s, n = line.rstrip("\n").split("|", 1)
+                    _NAMES[s] = n
+        except OSError:
+            pass
+    if not ticker:
+        return False
+    if re.search(r"\b%s\b" % re.escape(ticker), title):
+        return True
+    words = [w for w in re.findall(r"[A-Za-z][A-Za-z&'.-]+", _NAMES.get(ticker, ""))
+             if w.lower() not in ("the", "inc", "inc.", "corp", "corporation", "co", "company", "group", "holdings")]
+    return bool(words) and len(words[0]) >= 3 and re.search(r"\b%s\b" % re.escape(words[0]), title, re.I) is not None
 
 
 def self_check(c, extra=None):
@@ -479,6 +507,10 @@ def mode_signals(args, now_override=None, review=False):
     orb = run_json([SK + "/trader-scanner/scan.py", "orb", "--watchlist", "trader/candidates.json",
                     "--min-price", "0", "--no-write", "--now", now_arg], timeout=600) if cand else {"hits": []}
     extra = []
+    if "_error" in orb:
+        # The scanner refuses outside 9:50-11:30 ET (or on a data error) with one plain line.
+        extra.append("OPENING-RANGE SCAN DID NOT RUN: %s. This is NOT a 'no trade' result."
+                     % orb["_error"].split(": ", 1)[-1][:220])
     oc = orb.get("counts", {})
     if cand and oc and oc.get("scanned", 0) < 0.5 * len(cand):
         extra.append("DATA CHECK: only %s of %d candidate charts usable for the opening range"
